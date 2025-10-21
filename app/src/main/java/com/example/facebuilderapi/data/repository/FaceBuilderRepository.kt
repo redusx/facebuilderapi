@@ -136,7 +136,6 @@ class FaceBuilderRepository {
         var attempt = 0
         while (attempt < maxAttempts) {
             try {
-                // Request texture=true
                 val initialResponse = api.getNeutralTexturedGlb(avatarId = avatarId, texture = true)
 
                 when (initialResponse.code()) {

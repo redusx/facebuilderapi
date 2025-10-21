@@ -18,6 +18,8 @@ import com.example.facebuilderapi.ui.screens.MainScreen
 import com.example.facebuilderapi.ui.screens.ResultScreen
 import com.example.facebuilderapi.ui.theme.FaceBuilderApiTheme
 import com.example.facebuilderapi.viewmodel.FaceBuilderViewModel
+import com.example.facebuilderapi.ui.screens.LocalModelViewerScreen
+
 
 class MainActivity : ComponentActivity() {
     
@@ -45,10 +47,8 @@ fun AppNavigation(viewModel: FaceBuilderViewModel) {
         composable("main") {
             MainScreen(
                 viewModel = viewModel,
+                navController = navController,
                 onNavigateToResult = { avatarId ->
-                    // Note: The new flow gives a model URL, not just an ID.
-                    // We need to pass the URL to the result screen.
-                    // For now, we pass the avatarId, but ResultScreen will need an update.
                     navController.navigate("result/$avatarId")
                 }
             )
@@ -62,6 +62,9 @@ fun AppNavigation(viewModel: FaceBuilderViewModel) {
                 viewModel = viewModel,
                 avatarId = avatarId
             )
+        }
+        composable("localModelViewer") {
+            LocalModelViewerScreen(viewModel = viewModel)
         }
     }
 }

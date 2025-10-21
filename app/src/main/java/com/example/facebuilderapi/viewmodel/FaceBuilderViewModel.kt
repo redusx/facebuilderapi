@@ -35,6 +35,13 @@ class FaceBuilderViewModel(application: Application) : AndroidViewModel(applicat
     private val _modelData = MutableStateFlow<java.nio.ByteBuffer?>(null)
     val modelData = _modelData.asStateFlow()
 
+    private val _localModelData = MutableStateFlow<java.nio.ByteBuffer?>(null)
+    val localModelData = _localModelData.asStateFlow()
+
+    fun setLocalModelData(data: java.nio.ByteBuffer?) {
+        _localModelData.value = data
+    }
+
     fun loadModelForRendering(avatarId: String) {
         viewModelScope.launch {
             Log.d("ViewModel", "loadModelForRendering called with avatarId: $avatarId")

@@ -2,6 +2,7 @@ package com.example.facebuilderapi.ui.screens
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -23,6 +24,7 @@ import com.example.facebuilderapi.viewmodel.FaceBuilderViewModel
 @Composable
 fun MainScreen(
     viewModel: FaceBuilderViewModel,
+    navController: androidx.navigation.NavController,
     onNavigateToResult: (String) -> Unit
 ) {
     val uiState by viewModel.state.collectAsState()
@@ -39,6 +41,25 @@ fun MainScreen(
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents(),
         onResult = { uris -> viewModel.createAvatar(context, uris) } // Simplified: select and start
+    )
+
+    val localModelPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+        onResult = { uri: Uri? ->
+            uri?.let {
+                try {
+                    context.contentResolver.takePersistableUriPermission(it, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    val inputStream = context.contentResolver.openInputStream(it)
+                    val buffer = inputStream?.use { stream ->
+                        java.nio.ByteBuffer.wrap(stream.readBytes())
+                    }
+                    viewModel.setLocalModelData(buffer)
+                    navController.navigate("localModelViewer")
+                } catch (e: Exception) {
+                    Log.e("MainScreen", "Failed to load model", e)
+                }
+            }
+        }
     )
 
     Scaffold(
@@ -60,6 +81,10 @@ fun MainScreen(
                             OutlinedButton(onClick = { onNavigateToResult("LOCAL_TEST_MODEL") }) {
                                 Text("Test Local Renderer")
                             }
+                            Spacer(modifier = Modifier.height(16.dp))
+                            OutlinedButton(onClick = { localModelPickerLauncher.launch(arrayOf("*/*")) }) {
+                                Text("Load Local Model")
+                            }
                         }
                     }
                     is AvatarCreationState.Initializing -> {
@@ -80,7 +105,7 @@ fun MainScreen(
                     is AvatarCreationState.Running -> {
                         LinearProgressIndicator(progress = state.progress)
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text("Building model: ${(state.progress * 100).toInt()}%")
+                        Text("Building model: ${(state.progress * 100).toInt()}% ")
                     }
                     is AvatarCreationState.Error -> {
                         Text("An error occurred: ${state.message}", color = MaterialTheme.colorScheme.error)
@@ -97,3 +122,4 @@ fun MainScreen(
         }
     }
 }
+
