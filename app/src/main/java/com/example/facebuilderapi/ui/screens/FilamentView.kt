@@ -1,7 +1,6 @@
 package com.example.facebuilderapi.ui.screens
 
 import android.content.Context
-import android.net.Uri
 import android.opengl.Matrix
 import android.util.Log
 import android.view.Choreographer
@@ -12,6 +11,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.facebuilderapi.util.*
 import com.google.android.filament.Engine
 import com.google.android.filament.EntityManager
 import com.google.android.filament.gltfio.AssetLoader
@@ -25,50 +25,22 @@ import java.nio.ByteBuffer
 
 @Composable
 fun FilamentView(
-    modelData: ByteArray?,
-    attachmentUri: Uri?,
-    mainModelRotation: Float,
-    isAttachmentRotationMode: State<Boolean>,
-    modifier: Modifier = Modifier
+        modelData: ByteArray?,
+        glassesData: ByteArray?,
+        mainModelRotation: Float,
+        modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val modelViewer = remember { ModelViewer(context) }
 
-    // Log recomposition and current state
-    Log.d("FilamentView", "FilamentView recomposed. mainModelRotation: $mainModelRotation, isAttachmentRotationMode: ${isAttachmentRotationMode.value}")
+    LaunchedEffect(modelData) { modelData?.let { modelViewer.loadModelGlb(ByteBuffer.wrap(it)) } }
 
-    LaunchedEffect(modelData) {
-        modelData?.let {
-            modelViewer.loadModelGlb(ByteBuffer.wrap(it))
-        }
-    }
-
-    LaunchedEffect(attachmentUri) {
-        attachmentUri?.let {
-            context.contentResolver.openInputStream(it)?.use { inputStream ->
-                val byteBuffer = ByteBuffer.wrap(inputStream.readBytes())
-                modelViewer.loadAttachmentModel(byteBuffer)
-            }
-        }
-    }
+    LaunchedEffect(glassesData) { glassesData?.let { modelViewer.loadGlassesAligned(it) } }
 
     // Update main model rotation
-    LaunchedEffect(mainModelRotation) {
-        modelViewer.setMainModelRotation(mainModelRotation)
-    }
+    LaunchedEffect(mainModelRotation) { modelViewer.setMainModelRotation(mainModelRotation) }
 
-    // Update attachment rotation mode
-    LaunchedEffect(isAttachmentRotationMode.value) {
-        modelViewer.isAttachmentRotationMode.value = isAttachmentRotationMode.value
-        modelViewer.setupTouchEvents() // Recreate listener with updated state
-        Log.d("FilamentView", "isAttachmentRotationMode updated to: ${isAttachmentRotationMode.value}")
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            modelViewer.destroy()
-        }
-    }
+    DisposableEffect(Unit) { onDispose { modelViewer.destroy() } }
 
     AndroidView(factory = { modelViewer.surfaceView }, modifier = modifier)
 }
@@ -84,10 +56,11 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
 
     val surfaceView: SurfaceView = SurfaceView(context)
     private val choreographer: Choreographer = Choreographer.getInstance()
-    private val frameCallback: Choreographer.FrameCallback = Choreographer.FrameCallback { frameTimeNanos ->
-        choreographer.postFrameCallback(this.frameCallback)
-        render(frameTimeNanos)
-    }
+    private val frameCallback: Choreographer.FrameCallback =
+            Choreographer.FrameCallback { frameTimeNanos ->
+                choreographer.postFrameCallback(this.frameCallback)
+                render(frameTimeNanos)
+            }
 
     private val engine: Engine = Engine.create()
     private val materialProvider: MaterialProvider = UbershaderProvider(engine)
@@ -111,6 +84,8 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
     var isAttachmentRotationMode: MutableState<Boolean> = mutableStateOf(false)
     private var initialMainModelTransform: FloatArray? = null
     private var initialAttachmentTransform: FloatArray? = null
+    private var headModelRawData: ByteArray? = null
+    private var glassesAlignmentMatrix: FloatArray? = null
 
     private inner class ScaleListener : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
@@ -127,12 +102,18 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
         view.camera = camera
         view.scene = scene
 
-        val iblBuffer = context.assets.open("venetian_crossroads_2k_ibl.ktx").use { ByteBuffer.wrap(it.readBytes()) }
+        val iblBuffer =
+                context.assets.open("venetian_crossroads_2k_ibl.ktx").use {
+                    ByteBuffer.wrap(it.readBytes())
+                }
         val ibl = KTX1Loader.createIndirectLight(engine, iblBuffer)
         scene.indirectLight = ibl.indirectLight
         scene.indirectLight!!.intensity = 30_000.0f
 
-        val skyboxBuffer = context.assets.open("venetian_crossroads_2k_skybox.ktx").use { ByteBuffer.wrap(it.readBytes()) }
+        val skyboxBuffer =
+                context.assets.open("venetian_crossroads_2k_skybox.ktx").use {
+                    ByteBuffer.wrap(it.readBytes())
+                }
         val skybox = KTX1Loader.createSkybox(engine, skyboxBuffer)
         scene.skybox = skybox.skybox
 
@@ -144,10 +125,21 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
         choreographer.postFrameCallback(frameCallback)
     }
 
-    override fun surfaceChanged(holder: android.view.SurfaceHolder, format: Int, width: Int, height: Int) {
+    override fun surfaceChanged(
+            holder: android.view.SurfaceHolder,
+            format: Int,
+            width: Int,
+            height: Int
+    ) {
         view.viewport = com.google.android.filament.Viewport(0, 0, width, height)
         val aspect = width.toDouble() / height.toDouble()
-        camera.setProjection(45.0, aspect, 0.1, 1000.0, com.google.android.filament.Camera.Fov.VERTICAL)
+        camera.setProjection(
+                45.0,
+                aspect,
+                0.1,
+                1000.0,
+                com.google.android.filament.Camera.Fov.VERTICAL
+        )
     }
 
     override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
@@ -160,22 +152,132 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
     }
 
     fun loadModelGlb(buffer: ByteBuffer) {
+        // Store raw data for later use by glasses alignment
+        val bytes = ByteArray(buffer.remaining())
+        buffer.duplicate().get(bytes)
+        headModelRawData = bytes
+
         modelAsset?.let {
             scene.removeEntities(it.entities)
             assetLoader.destroyAsset(it)
         }
-        modelAsset = assetLoader.createAsset(buffer)?.also {
-            resourceLoader.loadResources(it)
-            it.releaseSourceData()
-            scene.addEntities(it.entities)
-            frameCamera(it)
-            // Store initial transform
-            val tm = engine.transformManager
-            val root = tm.getInstance(it.root)
-            initialMainModelTransform = FloatArray(16)
-            tm.getTransform(root, initialMainModelTransform!!)
-            setMainModelRotation(180f) // Set initial rotation to 0 degrees (slider middle)
-            Log.d("ModelViewer", "initialMainModelTransform set after loading model.")
+        modelAsset =
+                assetLoader.createAsset(buffer)?.also {
+                    resourceLoader.loadResources(it)
+                    it.releaseSourceData()
+                    scene.addEntities(it.entities)
+                    frameCamera(it)
+                    // Store initial transform
+                    val tm = engine.transformManager
+                    val root = tm.getInstance(it.root)
+                    initialMainModelTransform = FloatArray(16)
+                    tm.getTransform(root, initialMainModelTransform!!)
+                    setMainModelRotation(180f) // Set initial rotation to 0 degrees (slider middle)
+                    Log.d("ModelViewer", "initialMainModelTransform set after loading model.")
+                }
+    }
+
+    /**
+     * Loads a glasses GLB model and automatically aligns it to the head model using landmark vertex
+     * positions and anchor metadata. The glasses become a child of the head root so they follow
+     * head rotation.
+     */
+    fun loadGlassesAligned(glassesGlbData: ByteArray) {
+        val headData =
+                headModelRawData
+                        ?: run {
+                            Log.e("ModelViewer", "Head model raw data not available")
+                            return
+                        }
+        val headAsset =
+                modelAsset
+                        ?: run {
+                            Log.e("ModelViewer", "Head model not loaded in Filament")
+                            return
+                        }
+
+        try {
+            // 1. Parse head model → extract landmark vertex positions
+            val headParser = GlbParser(headData)
+            val landmarks =
+                    FaceLandmarks(
+                            noseBridge = headParser.getVertexPosition(HeadLandmarks.NOSE_BRIDGE),
+                            leftEyeInner =
+                                    headParser.getVertexPosition(HeadLandmarks.LEFT_EYE_INNER),
+                            rightEyeInner =
+                                    headParser.getVertexPosition(HeadLandmarks.RIGHT_EYE_INNER),
+                            leftEarTragus =
+                                    headParser.getVertexPosition(HeadLandmarks.LEFT_EAR_TRAGUS),
+                            rightEarTragus =
+                                    headParser.getVertexPosition(HeadLandmarks.RIGHT_EAR_TRAGUS)
+                    )
+            Log.d(
+                    "ModelViewer",
+                    "Head landmarks: noseBridge=${landmarks.noseBridge.contentToString()}"
+            )
+
+            // 2. Parse glasses model → extract anchor metadata from extras
+            val glassesParser = GlbParser(glassesGlbData)
+            // Diagnostic: dump the raw nodes JSON to understand Blender export format
+            val nodesDump = glassesParser.dumpNodesJson()
+            Log.w("ModelViewer", "GLASSES NODES DUMP:\n$nodesDump")
+            val anchors = glassesParser.getGlassesAnchors()
+            if (anchors == null) {
+                Log.w(
+                        "ModelViewer",
+                        "No glasses anchor metadata found — falling back to bounding-box placement"
+                )
+                loadAttachmentModel(ByteBuffer.wrap(glassesGlbData))
+                return
+            }
+            Log.d(
+                    "ModelViewer",
+                    "Glasses anchors: noseBridge=${anchors.noseBridge.contentToString()}"
+            )
+
+            // 3. Compute alignment transform
+            val alignmentMatrix = GlassesAligner.computeAlignmentTransform(landmarks, anchors)
+
+            // 4. Load glasses into Filament scene
+            attachmentAsset?.let {
+                scene.removeEntities(it.entities)
+                assetLoader.destroyAsset(it)
+            }
+            attachmentAsset =
+                    assetLoader.createAsset(ByteBuffer.wrap(glassesGlbData))?.also {
+                        resourceLoader.loadResources(it)
+                        it.releaseSourceData()
+                        scene.addEntities(it.entities)
+
+                        // 5. Apply alignment in world space
+                        // Get the head's world transform so glasses follow the head
+                        val tm = engine.transformManager
+                        val headRoot = tm.getInstance(headAsset.root)
+                        val headWorldTransform = FloatArray(16)
+                        // Use the head's current world transform
+                        val headMat4 = tm.getWorldTransform(headRoot, headWorldTransform)
+
+                        // Combined = HeadWorldTransform * AlignmentMatrix
+                        val combined = FloatArray(16)
+                        android.opengl.Matrix.multiplyMM(
+                                combined,
+                                0,
+                                headWorldTransform,
+                                0,
+                                alignmentMatrix,
+                                0
+                        )
+
+                        val glassesRoot = tm.getInstance(it.root)
+                        tm.setTransform(glassesRoot, combined)
+
+                        // Store alignment matrix for re-application when head rotates
+                        this.glassesAlignmentMatrix = alignmentMatrix
+
+                        Log.d("ModelViewer", "Glasses aligned in world space (no parenting).")
+                    }
+        } catch (e: Exception) {
+            Log.e("ModelViewer", "Failed to align glasses", e)
         }
     }
 
@@ -185,40 +287,48 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
             scene.removeEntities(it.entities)
             assetLoader.destroyAsset(it)
         }
-        attachmentAsset = assetLoader.createAsset(buffer)?.also {
-            resourceLoader.loadResources(it)
-            it.releaseSourceData()
-            scene.addEntities(it.entities)
+        attachmentAsset =
+                assetLoader.createAsset(buffer)?.also {
+                    resourceLoader.loadResources(it)
+                    it.releaseSourceData()
+                    scene.addEntities(it.entities)
 
-            // Initial positioning and scaling for the attachment
-            modelAsset?.let { mainAsset ->
-                val mainBBox = mainAsset.boundingBox
-                val attachmentBBox = it.boundingBox
+                    // Initial positioning and scaling for the attachment
+                    modelAsset?.let { mainAsset ->
+                        val mainBBox = mainAsset.boundingBox
+                        val attachmentBBox = it.boundingBox
 
-                val mainCenter = mainBBox.center.let { floatArrayOf(it[0], it[1], it[2]) }
-                val mainHalfExtent = mainBBox.halfExtent.let { floatArrayOf(it[0], it[1], it[2]) }
-                val attachmentCenter = attachmentBBox.center.let { floatArrayOf(it[0], it[1], it[2]) }
-                val attachmentHalfExtent = attachmentBBox.halfExtent.let { floatArrayOf(it[0], it[1], it[2]) }
+                        val mainCenter = mainBBox.center.let { floatArrayOf(it[0], it[1], it[2]) }
+                        val mainHalfExtent =
+                                mainBBox.halfExtent.let { floatArrayOf(it[0], it[1], it[2]) }
+                        val attachmentCenter =
+                                attachmentBBox.center.let { floatArrayOf(it[0], it[1], it[2]) }
+                        val attachmentHalfExtent =
+                                attachmentBBox.halfExtent.let { floatArrayOf(it[0], it[1], it[2]) }
 
-                val tm = engine.transformManager
-                val root = tm.getInstance(it.root)
-                val transform = FloatArray(16)
-                Matrix.setIdentityM(transform, 0)
+                        val tm = engine.transformManager
+                        val root = tm.getInstance(it.root)
+                        val transform = FloatArray(16)
+                        Matrix.setIdentityM(transform, 0)
 
-                // Calculate scale factor to fit attachment relative to main model
-                // This is a heuristic, adjust as needed
-                val scaleFactor = (mainHalfExtent[0] * 0.5f) / attachmentHalfExtent[0].coerceAtLeast(0.001f)
-                Matrix.scaleM(transform, 0, scaleFactor, scaleFactor, scaleFactor)
+                        val scaleFactor =
+                                (mainHalfExtent[0] * 0.5f) /
+                                        attachmentHalfExtent[0].coerceAtLeast(0.001f)
+                        Matrix.scaleM(transform, 0, scaleFactor, scaleFactor, scaleFactor)
 
-                // Translate to be in front of the main model, slightly above its center
-                Matrix.translateM(transform, 0, mainCenter[0] - attachmentCenter[0], mainCenter[1] - attachmentCenter[1] + (mainHalfExtent[1] * 0.5f), mainCenter[2] - attachmentCenter[2] + (mainHalfExtent[2] * 1.2f))
+                        Matrix.translateM(
+                                transform,
+                                0,
+                                mainCenter[0] - attachmentCenter[0],
+                                mainCenter[1] - attachmentCenter[1] + (mainHalfExtent[1] * 0.5f),
+                                mainCenter[2] - attachmentCenter[2] + (mainHalfExtent[2] * 1.2f)
+                        )
 
-                tm.setTransform(root, transform)
-                // Store initial transform for attachment
-                initialAttachmentTransform = FloatArray(16)
-                tm.getTransform(root, initialAttachmentTransform!!)
-            }
-        }
+                        tm.setTransform(root, transform)
+                        initialAttachmentTransform = FloatArray(16)
+                        tm.getTransform(root, initialAttachmentTransform!!)
+                    }
+                }
     }
 
     fun setMainModelRotation(rotationDegrees: Float) {
@@ -232,11 +342,28 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
             initialMainModelTransform?.let { initialTransform ->
                 val rotationMatrix = FloatArray(16)
                 Matrix.setIdentityM(rotationMatrix, 0)
-                Matrix.rotateM(rotationMatrix, 0, actualModelRotation, 0f, 1f, 0f) // Y-axis rotation
+                Matrix.rotateM(
+                        rotationMatrix,
+                        0,
+                        actualModelRotation,
+                        0f,
+                        1f,
+                        0f
+                ) // Y-axis rotation
 
                 val finalTransform = FloatArray(16)
                 Matrix.multiplyMM(finalTransform, 0, rotationMatrix, 0, initialTransform, 0)
                 tm.setTransform(root, finalTransform)
+
+                // Re-apply glasses transform so they follow head rotation
+                glassesAlignmentMatrix?.let { alignMat ->
+                    attachmentAsset?.let { glassesAsset ->
+                        val glassesRoot = tm.getInstance(glassesAsset.root)
+                        val combined = FloatArray(16)
+                        Matrix.multiplyMM(combined, 0, finalTransform, 0, alignMat, 0)
+                        tm.setTransform(glassesRoot, combined)
+                    }
+                }
             }
         }
     }
@@ -254,7 +381,13 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
             // 1. Translate to origin (relative to current position)
             val toOrigin = FloatArray(16)
             Matrix.setIdentityM(toOrigin, 0)
-            Matrix.translateM(toOrigin, 0, -attachmentCenter[0], -attachmentCenter[1], -attachmentCenter[2])
+            Matrix.translateM(
+                    toOrigin,
+                    0,
+                    -attachmentCenter[0],
+                    -attachmentCenter[1],
+                    -attachmentCenter[2]
+            )
 
             // 2. Apply rotation
             val rotationMatrix = FloatArray(16)
@@ -265,7 +398,13 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
             // 3. Translate back from origin
             val fromOrigin = FloatArray(16)
             Matrix.setIdentityM(fromOrigin, 0)
-            Matrix.translateM(fromOrigin, 0, attachmentCenter[0], attachmentCenter[1], attachmentCenter[2])
+            Matrix.translateM(
+                    fromOrigin,
+                    0,
+                    attachmentCenter[0],
+                    attachmentCenter[1],
+                    attachmentCenter[2]
+            )
 
             // Combine transformations: current -> toOrigin -> rotate -> fromOrigin
             val temp1 = FloatArray(16)
@@ -313,9 +452,15 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
         val up = floatArrayOf(0.0f, 1.0f, 0.0f)
 
         camera.lookAt(
-            eye[0].toDouble(), eye[1].toDouble(), eye[2].toDouble(),
-            target[0].toDouble(), target[1].toDouble(), target[2].toDouble(),
-            up[0].toDouble(), up[1].toDouble(), up[2].toDouble()
+                eye[0].toDouble(),
+                eye[1].toDouble(),
+                eye[2].toDouble(),
+                target[0].toDouble(),
+                target[1].toDouble(),
+                target[2].toDouble(),
+                up[0].toDouble(),
+                up[1].toDouble(),
+                up[2].toDouble()
         )
     }
 
@@ -328,7 +473,10 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
     }
 
     fun setupTouchEvents() {
-        Log.d("ModelViewer", "setupTouchEvents called. Current isAttachmentRotationMode: ${this.isAttachmentRotationMode.value}")
+        Log.d(
+                "ModelViewer",
+                "setupTouchEvents called. Current isAttachmentRotationMode: ${this.isAttachmentRotationMode.value}"
+        )
         surfaceView.setOnTouchListener { _, event ->
             scaleDetector.onTouchEvent(event)
             if (scaleDetector.isInProgress) {
@@ -347,7 +495,10 @@ class ModelViewer(context: Context) : android.view.SurfaceHolder.Callback {
                     lastY = event.y
 
                     if (attachmentAsset != null) {
-                        Log.d("ModelViewer", "onTouchEvent - isAttachmentRotationMode: ${this.isAttachmentRotationMode.value}")
+                        Log.d(
+                                "ModelViewer",
+                                "onTouchEvent - isAttachmentRotationMode: ${this.isAttachmentRotationMode.value}"
+                        )
                         if (this.isAttachmentRotationMode.value) {
                             rotateAttachment(deltaX, deltaY)
                         } else {
