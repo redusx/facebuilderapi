@@ -32,6 +32,7 @@ fun LocalModelViewerScreen(viewModel: com.example.facebuilderapi.viewmodel.FaceB
     val context = LocalContext.current
 
     var mainModelRotation by remember { mutableStateOf(180f) }
+    var glassesScale by remember { mutableStateOf(1.0f) } // Manual scale multiplier
 
     val glassesPickerLauncher =
             rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
@@ -49,6 +50,7 @@ fun LocalModelViewerScreen(viewModel: com.example.facebuilderapi.viewmodel.FaceB
                                     java.nio.ByteBuffer.wrap(stream.readBytes())
                                 }
                         viewModel.setGlassesData(buffer)
+                        glassesScale = 1.0f // Reset scale when new glasses loaded
                         Log.d("LocalModelViewerScreen", "Glasses model loaded: $fileName")
                     } catch (e: Exception) {
                         Log.e("LocalModelViewerScreen", "Failed to load glasses model", e)
@@ -75,21 +77,48 @@ fun LocalModelViewerScreen(viewModel: com.example.facebuilderapi.viewmodel.FaceB
             }
     ) { paddingValues ->
         Column(modifier = Modifier.fillMaxSize().padding(paddingValues)) {
-            if (modelData != null) {
+            val cachedModelArray = remember(modelData) { modelData?.array() }
+            val cachedGlassesArray =
+                    remember(glassesData) {
+                        glassesData?.let {
+                            val arr = ByteArray(it.remaining())
+                            it.duplicate().get(arr)
+                            arr
+                        }
+                    }
+
+            if (cachedModelArray != null) {
                 FilamentView(
-                        modelData = modelData?.array(),
-                        glassesData =
-                                glassesData?.let {
-                                    val arr = ByteArray(it.remaining())
-                                    it.duplicate().get(arr)
-                                    arr
-                                },
+                        modelData = cachedModelArray,
+                        glassesData = cachedGlassesArray,
                         mainModelRotation = mainModelRotation,
+                        glassesScale = glassesScale,
                         modifier = Modifier.weight(1f)
                 )
             } else {
                 Text("Loading model...")
             }
+
+            // Glasses Scale Controls
+            if (glassesData != null) {
+                androidx.compose.foundation.layout.Row(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                ) {
+                    Text("Gözlük Boyutu: ", modifier = Modifier.weight(1f))
+                    androidx.compose.material3.Button(onClick = { glassesScale -= 0.05f }) {
+                        Text("-")
+                    }
+                    Text(
+                            text = String.format("%.2fx", glassesScale),
+                            modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                    androidx.compose.material3.Button(onClick = { glassesScale += 0.05f }) {
+                        Text("+")
+                    }
+                }
+            }
+
             // Slider for main model rotation
             Slider(
                     value = mainModelRotation,

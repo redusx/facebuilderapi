@@ -1,5 +1,6 @@
 package com.example.facebuilderapi.util
 
+import android.opengl.Matrix as AndroidMatrix
 import android.util.Log
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -8,16 +9,15 @@ import java.nio.ByteOrder
 
 /**
  * Minimal GLB (Binary glTF 2.0) parser. Extracts vertex positions at specific indices and
- * node-level extras metadata. No external library needed — uses Gson (already in project via
- * Retrofit).
+ * node-level extras metadata.
  */
 class GlbParser(glbData: ByteArray) {
 
     companion object {
         private const val TAG = "GlbParser"
-        private const val GLB_MAGIC = 0x46546C67 // "glTF"
-        private const val CHUNK_TYPE_JSON = 0x4E4F534A // JSON
-        private const val CHUNK_TYPE_BIN = 0x004E4942 // BIN
+        private const val GLB_MAGIC = 0x46546C67
+        private const val CHUNK_TYPE_JSON = 0x4E4F534A
+        private const val CHUNK_TYPE_BIN = 0x004E4942
         private const val COMPONENT_TYPE_FLOAT = 5126
     }
 
@@ -26,14 +26,11 @@ class GlbParser(glbData: ByteArray) {
 
     init {
         val buffer = ByteBuffer.wrap(glbData).order(ByteOrder.LITTLE_ENDIAN)
-
-        // --- Header (12 bytes) ---
         val magic = buffer.getInt()
         require(magic == GLB_MAGIC) { "Not a valid GLB file" }
         buffer.getInt() // version
         buffer.getInt() // totalLength
 
-        // --- JSON chunk ---
         val jsonChunkLength = buffer.getInt()
         val jsonChunkType = buffer.getInt()
         require(jsonChunkType == CHUNK_TYPE_JSON) { "First chunk must be JSON" }
@@ -44,7 +41,6 @@ class GlbParser(glbData: ByteArray) {
                         .parse(String(jsonBytes, Charsets.UTF_8).trimEnd('\u0000', ' '))
                         .asJsonObject
 
-        // --- BIN chunk ---
         val binChunkLength = buffer.getInt()
         val binChunkType = buffer.getInt()
         require(binChunkType == CHUNK_TYPE_BIN) { "Second chunk must be BIN" }
@@ -69,15 +65,13 @@ class GlbParser(glbData: ByteArray) {
     }
 
     /**
-     * Reads the 3D position (x,y,z) of a vertex at [vertexIndex] from mesh 0, primitive 0, POSITION
-     * attribute.
+     * Reads the 3D position (x,y,z) of a vertex at [vertexIndex] from mesh 0, primitive 0. Returns
+     * raw mesh-local coordinates.
      */
     fun getVertexPosition(vertexIndex: Int): FloatArray {
         val meshes = jsonObject.getAsJsonArray("meshes")
         val mesh0 = meshes[0].asJsonObject
         val primitives = mesh0.getAsJsonArray("primitives")
-        Log.d(TAG, "Mesh 0 has ${primitives.size()} primitive(s)")
-
         val primitive = primitives[0].asJsonObject
         val posAccessorIdx = primitive.getAsJsonObject("attributes").get("POSITION").asInt
 
@@ -85,25 +79,16 @@ class GlbParser(glbData: ByteArray) {
         val bufferViewIdx = accessor.get("bufferView").asInt
         val accByteOffset = if (accessor.has("byteOffset")) accessor.get("byteOffset").asInt else 0
         val count = accessor.get("count").asInt
-        Log.d(
-                TAG,
-                "POSITION accessor: idx=$posAccessorIdx, count=$count, bufferView=$bufferViewIdx, accByteOffset=$accByteOffset"
-        )
-        require(vertexIndex.compareTo(count) < 0) {
-            "Vertex $vertexIndex out of range (count=$count)"
-        }
+        require(vertexIndex < count) { "Vertex $vertexIndex out of range (count=$count)" }
         require(accessor.get("componentType").asInt == COMPONENT_TYPE_FLOAT)
 
         val bufferView = jsonObject.getAsJsonArray("bufferViews")[bufferViewIdx].asJsonObject
         val bvByteOffset =
                 if (bufferView.has("byteOffset")) bufferView.get("byteOffset").asInt else 0
         val bvByteStride =
-                if (bufferView.has("byteStride")) bufferView.get("byteStride").asInt
-                else 12 // VEC3 float = 12
-        Log.d(TAG, "BufferView: byteOffset=$bvByteOffset, byteStride=$bvByteStride")
+                if (bufferView.has("byteStride")) bufferView.get("byteStride").asInt else 12
 
         val offset = bvByteOffset + accByteOffset + (vertexIndex * bvByteStride)
-        Log.d(TAG, "Reading vertex $vertexIndex at byte offset $offset")
         return floatArrayOf(
                 binData.getFloat(offset),
                 binData.getFloat(offset + 4),
@@ -112,38 +97,47 @@ class GlbParser(glbData: ByteArray) {
     }
 
     /**
-     * Reads glasses anchor metadata from the first node that has an "anchors" field in its glTF
-     * extras. Supports two formats:
-     * 1. Vertex-index-based (preferred): {"nose_bridge_vertex":123, "left_lens_center_vertex":456,
-     * ...}
-     * 2. Coordinate-based (legacy): {"nose_bridge":[x,y,z], "left_lens_center":[x,y,z], ...}
-     * Vertex-index format reads positions from the mesh data, avoiding coordinate system issues.
+     * Builds the 4x4 TRS matrix for the first node that references the given mesh index. Returns
+     * identity if no transform is found.
+     */
+    fun getNodeTransformForMesh(meshIndex: Int = 0): FloatArray {
+        val nodes = jsonObject.getAsJsonArray("nodes") ?: return identityMatrix()
+        for (i in 0 until nodes.size()) {
+            val node = nodes[i].asJsonObject
+            if (node.has("mesh") && node.get("mesh").asInt == meshIndex) {
+                return buildNodeMatrix(node)
+            }
+        }
+        return identityMatrix()
+    }
+
+    /** Transforms a raw vertex position by the given 4x4 matrix → world-space. */
+    fun getVertexPositionWorldSpace(vertexIndex: Int, nodeTransform: FloatArray): FloatArray {
+        val local = getVertexPosition(vertexIndex)
+        val input = floatArrayOf(local[0], local[1], local[2], 1f)
+        val output = FloatArray(4)
+        AndroidMatrix.multiplyMV(output, 0, nodeTransform, 0, input, 0)
+        return floatArrayOf(output[0], output[1], output[2])
+    }
+
+    /**
+     * Reads glasses anchor metadata from glTF extras. Returns world-space positions (with node TRS
+     * applied) for vertex-index anchors.
      */
     fun getGlassesAnchors(): GlassesAnchors? {
         val nodes = jsonObject.getAsJsonArray("nodes") ?: return null
-        Log.d(TAG, "Scanning ${nodes.size()} nodes for glasses anchors...")
+        val meshNodeTransform = getNodeTransformForMesh(0)
+        Log.d(TAG, "Glasses mesh node TRS: ${meshNodeTransform.contentToString()}")
 
         for (i in 0 until nodes.size()) {
             val node = nodes[i].asJsonObject
             if (!node.has("extras")) continue
-
             val extrasElement = node.get("extras")
-            if (!extrasElement.isJsonObject) {
-                Log.d(TAG, "Node[$i] extras is not a JSON object: $extrasElement")
-                continue
-            }
-
+            if (!extrasElement.isJsonObject) continue
             val extras = extrasElement.asJsonObject
-            Log.d(TAG, "Node[$i] '${node.get("name")?.asString}' extras keys: ${extras.keySet()}")
-
             if (!extras.has("anchors")) continue
 
             val anchorsElement = extras.get("anchors")
-            Log.d(
-                    TAG,
-                    "Node[$i] anchors type: ${anchorsElement.javaClass.simpleName}, value: $anchorsElement"
-            )
-
             val anchorsObj =
                     try {
                         if (anchorsElement.isJsonObject) {
@@ -152,36 +146,41 @@ class GlbParser(glbData: ByteArray) {
                                         anchorsElement.asJsonPrimitive.isString
                         ) {
                             JsonParser().parse(anchorsElement.asString).asJsonObject
-                        } else {
-                            Log.e(TAG, "anchors is neither object nor string: $anchorsElement")
-                            continue
-                        }
+                        } else continue
                     } catch (e: Exception) {
-                        Log.e(TAG, "Failed to parse anchors JSON: $anchorsElement", e)
+                        Log.e(TAG, "Failed to parse anchors JSON", e)
                         continue
                     }
 
-            Log.d(TAG, "Anchors keys: ${anchorsObj.keySet()}")
-
-            // Vertex-index-based anchors (preferred)
             if (anchorsObj.has("nose_bridge_vertex")) {
-                Log.d(TAG, "Using vertex-index-based anchors")
+                Log.d(TAG, "Using vertex-index-based anchors (world-space)")
                 return try {
                     GlassesAnchors(
                             noseBridge =
-                                    getVertexPosition(anchorsObj.get("nose_bridge_vertex").asInt),
+                                    getVertexPositionWorldSpace(
+                                            anchorsObj.get("nose_bridge_vertex").asInt,
+                                            meshNodeTransform
+                                    ),
                             leftLensCenter =
-                                    getVertexPosition(
-                                            anchorsObj.get("left_lens_center_vertex").asInt
+                                    getVertexPositionWorldSpace(
+                                            anchorsObj.get("left_lens_center_vertex").asInt,
+                                            meshNodeTransform
                                     ),
                             rightLensCenter =
-                                    getVertexPosition(
-                                            anchorsObj.get("right_lens_center_vertex").asInt
+                                    getVertexPositionWorldSpace(
+                                            anchorsObj.get("right_lens_center_vertex").asInt,
+                                            meshNodeTransform
                                     ),
                             leftEarTip =
-                                    getVertexPosition(anchorsObj.get("left_ear_tip_vertex").asInt),
+                                    getVertexPositionWorldSpace(
+                                            anchorsObj.get("left_ear_tip_vertex").asInt,
+                                            meshNodeTransform
+                                    ),
                             rightEarTip =
-                                    getVertexPosition(anchorsObj.get("right_ear_tip_vertex").asInt)
+                                    getVertexPositionWorldSpace(
+                                            anchorsObj.get("right_ear_tip_vertex").asInt,
+                                            meshNodeTransform
+                                    )
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to read anchor vertex positions", e)
@@ -189,7 +188,6 @@ class GlbParser(glbData: ByteArray) {
                 }
             }
 
-            // Coordinate-based anchors (legacy)
             if (anchorsObj.has("nose_bridge")) {
                 Log.d(TAG, "Using coordinate-based anchors (legacy)")
                 return GlassesAnchors(
@@ -200,11 +198,80 @@ class GlbParser(glbData: ByteArray) {
                         rightEarTip = parseVec3(anchorsObj, "right_ear_tip")
                 )
             }
-
-            Log.w(TAG, "anchors object has no recognized keys: ${anchorsObj.keySet()}")
         }
         Log.e(TAG, "No node found with valid 'anchors' in extras")
         return null
+    }
+
+    private fun buildNodeMatrix(node: JsonObject): FloatArray {
+        val m = FloatArray(16)
+        AndroidMatrix.setIdentityM(m, 0)
+
+        if (node.has("matrix")) {
+            val matArr = node.getAsJsonArray("matrix")
+            for (i in 0 until 16) m[i] = matArr[i].asFloat
+            return m
+        }
+
+        val t =
+                if (node.has("translation")) {
+                    val arr = node.getAsJsonArray("translation")
+                    floatArrayOf(arr[0].asFloat, arr[1].asFloat, arr[2].asFloat)
+                } else floatArrayOf(0f, 0f, 0f)
+
+        val r =
+                if (node.has("rotation")) {
+                    val arr = node.getAsJsonArray("rotation")
+                    floatArrayOf(arr[0].asFloat, arr[1].asFloat, arr[2].asFloat, arr[3].asFloat)
+                } else floatArrayOf(0f, 0f, 0f, 1f)
+
+        val s =
+                if (node.has("scale")) {
+                    val arr = node.getAsJsonArray("scale")
+                    floatArrayOf(arr[0].asFloat, arr[1].asFloat, arr[2].asFloat)
+                } else floatArrayOf(1f, 1f, 1f)
+
+        // Quaternion → rotation matrix
+        val qx = r[0]
+        val qy = r[1]
+        val qz = r[2]
+        val qw = r[3]
+        val rotMat = FloatArray(16)
+        AndroidMatrix.setIdentityM(rotMat, 0)
+        rotMat[0] = 1 - 2 * (qy * qy + qz * qz)
+        rotMat[1] = 2 * (qx * qy + qz * qw)
+        rotMat[2] = 2 * (qx * qz - qy * qw)
+        rotMat[4] = 2 * (qx * qy - qz * qw)
+        rotMat[5] = 1 - 2 * (qx * qx + qz * qz)
+        rotMat[6] = 2 * (qy * qz + qx * qw)
+        rotMat[8] = 2 * (qx * qz + qy * qw)
+        rotMat[9] = 2 * (qy * qz - qx * qw)
+        rotMat[10] = 1 - 2 * (qx * qx + qy * qy)
+
+        // M = T * R * S
+        val scaleMat = FloatArray(16)
+        AndroidMatrix.setIdentityM(scaleMat, 0)
+        scaleMat[0] = s[0]
+        scaleMat[5] = s[1]
+        scaleMat[10] = s[2]
+
+        val rs = FloatArray(16)
+        AndroidMatrix.multiplyMM(rs, 0, rotMat, 0, scaleMat, 0)
+
+        val transMat = FloatArray(16)
+        AndroidMatrix.setIdentityM(transMat, 0)
+        transMat[12] = t[0]
+        transMat[13] = t[1]
+        transMat[14] = t[2]
+
+        AndroidMatrix.multiplyMM(m, 0, transMat, 0, rs, 0)
+        return m
+    }
+
+    private fun identityMatrix(): FloatArray {
+        val m = FloatArray(16)
+        AndroidMatrix.setIdentityM(m, 0)
+        return m
     }
 
     private fun parseVec3(obj: JsonObject, key: String): FloatArray {

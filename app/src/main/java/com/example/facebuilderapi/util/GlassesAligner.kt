@@ -21,7 +21,11 @@ object GlassesAligner {
      * Computes the alignment transform: glasses-local → head-local space. Returns a 4x4
      * column-major matrix suitable for Android's Matrix / Filament.
      */
-    fun computeAlignmentTransform(head: FaceLandmarks, glasses: GlassesAnchors): FloatArray {
+    fun computeAlignmentTransform(
+            head: FaceLandmarks,
+            glasses: GlassesAnchors,
+            manualScale: Float = 1.0f
+    ): FloatArray {
 
         // Debug: log all input positions
         Log.d(TAG, "=== ALIGNMENT DEBUG ===")
@@ -37,14 +41,30 @@ object GlassesAligner {
         Log.d(TAG, "Glasses rightEarTip: ${glasses.rightEarTip.contentToString()}")
 
         // --- 1. SCALE ---
-        val headIPD = distance(head.leftEyeInner, head.rightEyeInner)
-        val glassesIPD = distance(glasses.leftLensCenter, glasses.rightLensCenter)
-        val scale = if (glassesIPD > 0.0001f) headIPD / glassesIPD else 1f
-        Log.d(TAG, "IPD: head=$headIPD, glasses=$glassesIPD, scale=$scale")
+        // The user's lens center vertices are asymmetric (Y=3.0 vs 1.3). Using them for scale/axes
+        // ruins everything.
+        // The ear tips are perfectly symmetric! We use the distance between ears for scale.
+        val headEarDist = distance(head.leftEarTragus, head.rightEarTragus)
+        val glassesEarDist = distance(glasses.leftEarTip, glasses.rightEarTip)
+        // Apply 0.85x multiplier because ear tips on glasses are usually wider than ear tragus on
+        // head
+        val scale =
+                (if (glassesEarDist > 0.0001f) headEarDist / glassesEarDist else 1f) *
+                        0.85f *
+                        manualScale
+        Log.d(TAG, "EarDist: head=$headEarDist, glasses=$glassesEarDist, scale=$scale")
+
+        // --- 1.5. FIX BROKEN NOSE BRIDGE METADATA ---
+        // The user's nose_bridge_vertex is completely wrong (it's at X=0, but glasses are at X=17).
+        // It causes a 90-degree rotation and bad translation. We dynamically calculate the nose
+        // bridge
+        // as the midpoint between the two lenses.
+        val gNoseBridge = mid(glasses.leftLensCenter, glasses.rightLensCenter)
+        Log.d(TAG, "Computed real glasses nose bridge: ${gNoseBridge.contentToString()}")
 
         // --- 2. COORDINATE FRAMES ---
-        // Head frame
-        val headX = normalize(sub(head.rightEyeInner, head.leftEyeInner)) // right
+        // Head frame (using ear tragus for the X axis to be stable)
+        val headX = normalize(sub(head.rightEarTragus, head.leftEarTragus)) // right
         val headEarMid = mid(head.leftEarTragus, head.rightEarTragus)
         val headFwd = normalize(sub(head.noseBridge, headEarMid)) // forward
         val headY = normalize(cross(headFwd, headX)) // up
@@ -53,17 +73,16 @@ object GlassesAligner {
         Log.d(TAG, "Head frame Y(up): ${headY.contentToString()}")
         Log.d(TAG, "Head frame Z(fwd): ${headZ.contentToString()}")
 
-        // Glasses frame
-        val gX = normalize(sub(glasses.rightLensCenter, glasses.leftLensCenter)) // right
+        // Glasses frame (using ear tips for X axis since they are symmetric)
+        val gX = normalize(sub(glasses.rightEarTip, glasses.leftEarTip)) // right
         val gEarMid = mid(glasses.leftEarTip, glasses.rightEarTip)
-        val gFwd = normalize(sub(glasses.noseBridge, gEarMid)) // forward
+        // Use exactly the computed nose bridge instead of the broken metadata one
+        val gFwd = normalize(sub(gNoseBridge, gEarMid)) // forward
         val gY = normalize(cross(gFwd, gX)) // up
         val gZ = normalize(cross(gX, gY)) // re-ortho forward
         Log.d(TAG, "Glasses frame X(right): ${gX.contentToString()}")
         Log.d(TAG, "Glasses frame Y(up): ${gY.contentToString()}")
         Log.d(TAG, "Glasses frame Z(fwd): ${gZ.contentToString()}")
-        Log.d(TAG, "Glasses earMid: ${gEarMid.contentToString()}")
-        Log.d(TAG, "Glasses fwd(raw): ${sub(glasses.noseBridge, gEarMid).contentToString()}")
 
         // --- 3. ROTATION: R = HeadFrame * GlassesFrame^T ---
         val hMat = frameToMatrix(headX, headY, headZ)
@@ -72,12 +91,12 @@ object GlassesAligner {
         Matrix.multiplyMM(rotMat, 0, hMat, 0, gtMat, 0)
 
         // --- 4. COMBINE: T(head_nose) * R * S * T(-glasses_nose) ---
-        // Step A: Translate glasses so their nose bridge moves to origin
+        // Step A: Translate glasses so the COMPUTED nose bridge moves to origin
         val toOrigin = FloatArray(16)
         Matrix.setIdentityM(toOrigin, 0)
-        toOrigin[12] = -glasses.noseBridge[0]
-        toOrigin[13] = -glasses.noseBridge[1]
-        toOrigin[14] = -glasses.noseBridge[2]
+        toOrigin[12] = -gNoseBridge[0]
+        toOrigin[13] = -gNoseBridge[1]
+        toOrigin[14] = -gNoseBridge[2]
 
         // Step B: Scale
         val scaleMat = FloatArray(16)
@@ -97,7 +116,13 @@ object GlassesAligner {
         // Step E: T(head_nose) * R * S * T(-glasses_nose)
         val transMat = FloatArray(16)
         Matrix.setIdentityM(transMat, 0)
-        transMat[12] = head.noseBridge[0]
+
+        // To fix the "1-2cm right shift", we don't just put it on the head.noseBridge X.
+        // We explicitly align the geometric center of the glasses to the geometric center of the
+        // head.
+        // The head's center on the X-axis is headEarMid[0].
+        // So we set the target X to be headEarMid[0], but Y and Z stay locked to the noseBridge.
+        transMat[12] = headEarMid[0]
         transMat[13] = head.noseBridge[1]
         transMat[14] = head.noseBridge[2]
 
